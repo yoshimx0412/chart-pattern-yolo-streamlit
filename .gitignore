@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.streamlit/
+runs/
+uploaded_video.mp4
+*.mp4
+*.avi
+*.mov
+*.mkv
+.DS_Store
