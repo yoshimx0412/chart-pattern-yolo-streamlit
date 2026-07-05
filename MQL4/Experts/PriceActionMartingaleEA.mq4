@@ -74,6 +74,11 @@ datetime LastTradedPatternD2  = 0;      // 直近発火パターンID: Time[b2]
 int      LastTradedPatternDir = 0;      // 直近発火パターンID: 方向
 int      LastClosedTicket     = -1;     // 最後に集計した決済チケット(二重集計防止)
 
+datetime gLastProcessedCloseTime = 0;   // 集計済み決済時刻(未集計注文の抽出基準)
+int      gIgnoredTicket       = -1;     // 勝敗集計から除外するチケット(ECN設定失敗の緊急クローズ)
+int      gPrevHistoryTotal    = -1;     // 履歴走査の間引き用: 前回の履歴件数
+int      gPrevOpenCount       = -1;     // 履歴走査の間引き用: 前回の自EAポジション数
+
 double   gPipPoint            = 0.0;    // 1pipの価格値(3/5桁ブローカー補正済み)
 int      gCurrentDay          = -1;     // 日次損失リセット用の日付(サーバー日)
 double   gTodayClosedProfit   = 0.0;    // 当日確定損益のキャッシュ(決済検知時に再計算)
@@ -115,6 +120,7 @@ void SaveState()
 {
    GlobalVariableSet(GvName("LEVEL"),  MartingaleLevel);
    GlobalVariableSet(GvName("HALTED"), TradingHalted ? 1.0 : 0.0);
+   GlobalVariableSet(GvName("IGNORE"), gIgnoredTicket);   // 勝敗集計から除外するチケット
 }
 
 //====================================================================
@@ -131,14 +137,27 @@ double NormalizeLot(double lot)
    if(lotStep <= 0.0) lotStep = 0.01;   // ゼロ除算ガード
    if(minLot  <= 0.0) minLot  = lotStep;
 
-   lot = MathFloor(lot / lotStep + 0.0000001) * lotStep;  // ステップに切り捨て
+   // 有効上限 = ブローカーMAXLOTと入力MaxLotの小さい方(§5.2)
+   double capLot = MaxLot;
+   if(maxLot > 0.0 && maxLot < capLot) capLot = maxLot;
 
-   // ブローカー上限と入力パラメータ上限の小さい方を採用(§5.2)
-   if(maxLot > 0.0 && lot > maxLot) lot = maxLot;
-   if(lot > MaxLot)                 lot = MathFloor(MaxLot / lotStep + 0.0000001) * lotStep;
-   if(lot < minLot)                 lot = minLot;          // 最小ロット未満は最小ロットに引き上げ
+   // 最小ロットが上限を超える設定では上限を守った発注が不可能 → 0を返して発注中止
+   if(minLot > capLot)
+   {
+      Log("MINLOT(" + DoubleToStr(minLot, 3) + ") > ロット上限(" + DoubleToStr(capLot, 3) +
+          ")のためロット算出不能。発注を中止します。");
+      return(0.0);
+   }
 
-   return(NormalizeDouble(lot, 2));
+   lot = MathFloor(lot / lotStep + 0.0000001) * lotStep;   // ステップに切り捨て
+   if(lot > capLot) lot = MathFloor(capLot / lotStep + 0.0000001) * lotStep;  // 上限に丸め
+   if(lot < minLot) lot = minLot;   // 最小ロット未満は最小ロットに引き上げ(上限内であることは確認済み)
+
+   // 丸め小数桁を LOTSTEP から動的算出(例: 0.001 → 3桁。固定2桁では3桁ステップと矛盾するため)
+   int lotDigits = (int)MathRound(-MathLog(lotStep) / MathLog(10.0));
+   if(lotDigits < 0) lotDigits = 0;
+   if(lotDigits > 8) lotDigits = 8;
+   return(NormalizeDouble(lot, lotDigits));
 }
 
 //--- マーチン段数からロットを算出: lot = BaseLot * LotMultiplier^Level(上限MaxLot)
@@ -219,54 +238,97 @@ void ApplyMaxStepsRule()
       {
          TradingHalted = true;
          LogAlert("最大マーチン段数(" + IntegerToString(MaxMartingaleSteps) +
-                  ")超過。取引を停止しました(手動再起動まで新規エントリーなし)。");
+                  ")超過。取引を停止しました。解除するには、ターミナルのグローバル変数ウィンドウ(F3)で " +
+                  GvName("HALTED") + "(必要に応じて " + GvName("LEVEL") +
+                  " も)を削除してからEAを再アタッチしてください。");
       }
    }
 }
 
 //--- 新規決済の検知と勝敗集計(毎ティック呼び出し)
 //    勝ち: 段数リセット / 負け: 段数+1して「待機」(エントリーは次のDB/DTシグナル確定まで行わない)
+//    未集計の決済注文をクローズ時刻の時系列で全件処理する
 void CheckClosedTrades()
 {
-   int      newestTicket = -1;
-   datetime newestClose  = 0;
-   double   newestProfit = 0.0;
+   // 間引き: 履歴件数と自EAポジション数に変化がない限り履歴を走査しない(毎ティック全走査の負荷対策)
+   int histTotal = OrdersHistoryTotal();
+   int openCount = CountOpenPositions();
+   if(histTotal == gPrevHistoryTotal && openCount == gPrevOpenCount) return;
+   gPrevHistoryTotal = histTotal;
+   gPrevOpenCount    = openCount;
 
-   // 履歴から自EAの最新決済注文を探す
-   for(int i = OrdersHistoryTotal() - 1; i >= 0; i--)
+   // 未集計(gLastProcessedCloseTime より新しい)の自EA決済注文を収集
+   datetime closeTimes[];
+   double   profits[];
+   int      tickets[];
+   ArrayResize(closeTimes, histTotal);
+   ArrayResize(profits,    histTotal);
+   ArrayResize(tickets,    histTotal);
+   int n = 0;
+   for(int i = 0; i < histTotal; i++)
    {
       if(!OrderSelect(i, SELECT_BY_POS, MODE_HISTORY)) continue;
       if(OrderMagicNumber() != MagicNumber)            continue;
       if(OrderSymbol()      != Symbol())               continue;
       if(OrderType() != OP_BUY && OrderType() != OP_SELL) continue;
-      if(OrderCloseTime() > newestClose ||
-         (OrderCloseTime() == newestClose && OrderTicket() > newestTicket))
+      if(OrderCloseTime() < gLastProcessedCloseTime)   continue;   // 集計済みより古い
+      if(OrderCloseTime() == gLastProcessedCloseTime &&
+         OrderTicket() <= LastClosedTicket)            continue;   // 同時刻は集計済みチケット以下を除外
+      closeTimes[n] = OrderCloseTime();
+      profits[n]    = OrderProfit() + OrderSwap() + OrderCommission();
+      tickets[n]    = OrderTicket();
+      n++;
+   }
+   if(n == 0) return;
+
+   // クローズ時刻の昇順(同時刻はチケット昇順)にソートし、時系列で処理する
+   for(int a = 1; a < n; a++)
+   {
+      datetime ct = closeTimes[a];
+      double   pf = profits[a];
+      int      tk = tickets[a];
+      int      b  = a - 1;
+      while(b >= 0 && (closeTimes[b] > ct || (closeTimes[b] == ct && tickets[b] > tk)))
       {
-         newestClose  = OrderCloseTime();
-         newestTicket = OrderTicket();
-         newestProfit = OrderProfit() + OrderSwap() + OrderCommission();
+         closeTimes[b + 1] = closeTimes[b];
+         profits[b + 1]    = profits[b];
+         tickets[b + 1]    = tickets[b];
+         b--;
       }
+      closeTimes[b + 1] = ct;
+      profits[b + 1]    = pf;
+      tickets[b + 1]    = tk;
    }
 
-   if(newestTicket < 0)                  return;  // 決済履歴なし
-   if(newestTicket == LastClosedTicket)  return;  // 集計済み(二重集計防止)
-
-   LastClosedTicket = newestTicket;
-
-   // 勝敗判定(§3.3): 損益+スワップ+手数料の合計。0(建値)は負け扱い=保守側
-   if(newestProfit > 0.0)
+   // 古い順に勝敗判定(§3.3): 損益+スワップ+手数料。0(建値)は負け扱い=保守側
+   for(int s = 0; s < n; s++)
    {
-      Log("決済検知: チケット" + IntegerToString(newestTicket) +
-          " 損益=" + DoubleToStr(newestProfit, 2) + " → 勝ち。マーチン段数を0にリセット。");
-      MartingaleLevel = 0;
-   }
-   else
-   {
-      MartingaleLevel++;
-      Log("決済検知: チケット" + IntegerToString(newestTicket) +
-          " 損益=" + DoubleToStr(newestProfit, 2) + " → 負け。マーチン段数=" +
-          IntegerToString(MartingaleLevel) + " で次のDB/DTシグナル確定まで待機。");
-      ApplyMaxStepsRule();
+      LastClosedTicket        = tickets[s];
+      gLastProcessedCloseTime = closeTimes[s];
+
+      // ECNのSL/TP設定失敗による緊急クローズは技術的失敗であり、勝敗集計から除外(マーチンさせない)
+      if(tickets[s] == gIgnoredTicket)
+      {
+         LogAlert("チケット" + IntegerToString(tickets[s]) +
+                  " はECN設定失敗の緊急クローズのため勝敗集計から除外します(マーチン段数は変更しません)。");
+         gIgnoredTicket = -1;   // 除外は当該チケット1回のみ有効
+         continue;
+      }
+
+      if(profits[s] > 0.0)
+      {
+         Log("決済検知: チケット" + IntegerToString(tickets[s]) +
+             " 損益=" + DoubleToStr(profits[s], 2) + " → 勝ち。マーチン段数を0にリセット。");
+         MartingaleLevel = 0;
+      }
+      else
+      {
+         MartingaleLevel++;
+         Log("決済検知: チケット" + IntegerToString(tickets[s]) +
+             " 損益=" + DoubleToStr(profits[s], 2) + " → 負け。マーチン段数=" +
+             IntegerToString(MartingaleLevel) + " で次のDB/DTシグナル確定まで待機。");
+         ApplyMaxStepsRule();
+      }
    }
 
    gTodayClosedProfit = CalcTodayClosedProfit();  // 日次損益キャッシュを更新
@@ -579,7 +641,17 @@ bool ExecuteEntry(int dir, double patternExtreme)
 
    // --- ストップレベル対応(§3.2/§7.5): 最小距離未満なら STOPLEVEL + 1 point に拡張
    double minDist = MarketInfo(Symbol(), MODE_STOPLEVEL) * Point;
-   if(slDist < minDist + Point) slDist = minDist + Point;
+   if(slDist < minDist + Point)
+   {
+      slDist = minDist + Point;
+      // 拡張後のSL距離が許容最大距離を超える場合も見送り(過大リスク回避。パターンベース時)
+      if(!UseFixedSlTp && slDist > MaxSlPips * gPipPoint)
+      {
+         Log("STOPLEVEL拡張後のSL距離 " + DoubleToStr(slDist / gPipPoint, 1) +
+             " pips > MaxSlPips " + DoubleToStr(MaxSlPips, 1) + " のためシグナル見送り。");
+         return(false);
+      }
+   }
 
    double tpDist = UseFixedSlTp ? TakeProfitPips * gPipPoint : slDist * RewardRatio;
    if(tpDist < minDist + Point) tpDist = minDist + Point;
@@ -602,8 +674,7 @@ bool ExecuteEntry(int dir, double patternExtreme)
    }
 
    // --- 発注(リクオート系エラーは最大3回リトライ)
-   double ecnSl = 0.0, ecnTp = 0.0;                   // ECNモード時のSL/TP保管用
-   int    ticket = -1;
+   int ticket = -1;
    for(int attempt = 1; attempt <= 3; attempt++)
    {
       RefreshRates();                                 // 発注直前に必ずレート更新
@@ -613,7 +684,6 @@ bool ExecuteEntry(int dir, double patternExtreme)
       price = NormalizeDouble(price, Digits);
       sl    = NormalizeDouble(sl,    Digits);
       tp    = NormalizeDouble(tp,    Digits);
-      ecnSl = sl; ecnTp = tp;
 
       // ECNモード時はSL/TPなしで発注し、約定後に OrderModify で設定(§5.3)
       double sendSl = EcnMode ? 0.0 : sl;
@@ -647,12 +717,13 @@ bool ExecuteEntry(int dir, double patternExtreme)
    // --- ECNモード: 約定価格ベースでSL/TPを OrderModify(失敗時3回リトライ→全失敗で成行クローズ)
    if(EcnMode)
    {
-      bool modified = false;
+      bool   modified = false;
+      double sl2 = 0.0, tp2 = 0.0;
       if(OrderSelect(ticket, SELECT_BY_TICKET))
       {
          double op = OrderOpenPrice();               // 実約定価格からSL/TPを再計算(§3.2)
-         double sl2 = (dir == DIR_BUY) ? op - slDist : op + slDist;
-         double tp2 = (dir == DIR_BUY) ? op + tpDist : op - tpDist;
+         sl2 = (dir == DIR_BUY) ? op - slDist : op + slDist;
+         tp2 = (dir == DIR_BUY) ? op + tpDist : op - tpDist;
          sl2 = NormalizeDouble(sl2, Digits);
          tp2 = NormalizeDouble(tp2, Digits);
          for(int m = 1; m <= 3 && !modified; m++)
@@ -667,7 +738,11 @@ bool ExecuteEntry(int dir, double patternExtreme)
       if(!modified)
       {
          // SL/TPを設定できないポジションは保持しない(安全側に倒す。§5.3)
-         LogAlert("ECNモードのSL/TP設定に全失敗。安全のためポジションを成行クローズします。");
+         // このクローズは技術的失敗のため勝敗集計から除外し、マーチン段数を変化させない
+         gIgnoredTicket = ticket;
+         SaveState();
+         LogAlert("ECNモードのSL/TP設定に全失敗。安全のためチケット" + IntegerToString(ticket) +
+                  " を成行クローズします(このクローズは勝敗集計から除外し、マーチン段数は変更しません)。");
          if(OrderSelect(ticket, SELECT_BY_TICKET))
          {
             for(int c = 1; c <= 3; c++)
@@ -682,7 +757,8 @@ bool ExecuteEntry(int dir, double patternExtreme)
          }
          return(false);
       }
-      Log("ECNモード: SL=" + DoubleToStr(ecnSl, Digits) + " TP=" + DoubleToStr(ecnTp, Digits) +
+      // 実際に OrderModify で設定した値をログ出力(発注前計算値ではなく約定価格ベースの値)
+      Log("ECNモード: SL=" + DoubleToStr(sl2, Digits) + " TP=" + DoubleToStr(tp2, Digits) +
           " をOrderModifyで設定しました。");
    }
 
@@ -791,8 +867,12 @@ int RebuildLevelFromHistory(bool &haltedByHistory)
    int level = 0;
    for(int s = 0; s < n; s++)
    {
+      if(tickets[s] == gIgnoredTicket) continue;   // ECN設定失敗の緊急クローズ(技術的失敗)は集計除外
       if(profits[s] > 0.0)
-         level = 0;                        // 勝ち → リセット
+      {
+         level           = 0;              // 勝ち → リセット
+         haltedByHistory = false;          // 勝ちが出たら停止判定も解除(ラッチさせない)
+      }
       else
       {
          level++;                          // 負け → 段数+1
@@ -804,8 +884,12 @@ int RebuildLevelFromHistory(bool &haltedByHistory)
       }
    }
 
-   // 最後に集計した決済チケットを記録(以後の二重集計を防止)
-   if(n > 0) LastClosedTicket = tickets[n - 1];
+   // 最後に集計した決済チケット/時刻を記録(以後の二重集計を防止)
+   if(n > 0)
+   {
+      LastClosedTicket        = tickets[n - 1];
+      gLastProcessedCloseTime = closeTimes[n - 1];
+   }
 
    return(level);
 }
@@ -877,6 +961,10 @@ int OnInit()
       return(INIT_PARAMETERS_INCORRECT);
    }
 
+   // 勝敗集計から除外するチケット(ECN設定失敗の緊急クローズ)をGVから復元(履歴再生より先に読む)
+   if(GlobalVariableCheck(GvName("IGNORE")))
+      gIgnoredTicket = (int)GlobalVariableGet(GvName("IGNORE"));
+
    // (1) 履歴走査によるマーチン段数の再構築
    bool haltedByHistory = false;
    int  histLevel       = RebuildLevelFromHistory(haltedByHistory);
@@ -913,13 +1001,21 @@ int OnInit()
    }
 
    // 新バー検知の基準を現在バーに設定(次の新バー確定から評価開始)
-   LastBarTime = Time[0];
+   // ヒストリー未ロード(Bars==0)時の Time[0] アクセスを回避
+   LastBarTime = (Bars > 0) ? Time[0] : 0;
+
+   // 履歴走査の間引き用カウンタを初期化
+   gPrevHistoryTotal = OrdersHistoryTotal();
+   gPrevOpenCount    = CountOpenPositions();
 
    SaveState();
    Log("初期化完了: マーチン段数=" + IntegerToString(MartingaleLevel) +
        " 恒久停止=" + (TradingHalted ? "true" : "false") +
        " 日次停止=" + (DailyHalted ? "true" : "false") +
        " PipPoint=" + DoubleToStr(gPipPoint, Digits));
+   if(TradingHalted)
+      Log("恒久停止状態で復元されています。解除するには、グローバル変数ウィンドウ(F3)で " +
+          GvName("HALTED") + " を削除してからEAを再アタッチしてください。");
    return(INIT_SUCCEEDED);
 }
 
@@ -932,6 +1028,9 @@ void OnDeinit(const int reason)
 //--- メインループ: 新バー検知 → 決済検知 → フィルタ → 検出 → エントリー(§8)
 void OnTick()
 {
+   // ヒストリー未ロード対策: バーが無い間は Time[0] アクセスを避けて何もしない
+   if(Bars < 1) return;
+
    // --- 毎ティック実行する管理処理 ---
    CheckClosedTrades();       // 決済検知/勝敗集計(マーチン段数の遷移)
    CheckDailyReset();         // 日付変更で日次停止を自動解除
